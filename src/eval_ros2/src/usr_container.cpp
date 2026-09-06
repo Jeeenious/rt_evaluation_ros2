@@ -17,12 +17,12 @@ int main(int argc, char ** argv)
   options.automatically_declare_parameters_from_overrides(true);
 
   // 预读线程数；缺省 0 → 走 MultiThreadedExecutor 默认值(硬件核数)
-  size_t num_threads = 0;
+  std::size_t num_threads = 0;
   {
     auto probe = std::make_shared<rclcpp::Node>("component_manager_probe", options);
     if (probe->has_parameter("num_threads")) {
       int v = probe->get_parameter("num_threads").as_int();
-      num_threads = (v > 0) ? static_cast<size_t>(v) : 0;
+      num_threads = (v > 0) ? static_cast<std::size_t>(v) : 0;
     }
   }
 
