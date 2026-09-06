@@ -8,7 +8,7 @@ from datetime import datetime
 # ================= 配置区 =================
 LAUNCH_DIR = "./launches"
 RESULT_BASE_DIR = "./reports"
-WARMUP_TIME = 1                # 增加到 5s，确保节点互联
+WARMUP_TIME = 5                # 增加到 5s，确保节点互联
 RUN_TIME = 2.0                # 增加到 15s
 
 # ROS 2 工作空间路径（修改为你的实际路径）

@@ -7,13 +7,12 @@
 【kind 与 ROS tracepoint 的对应关系】（我们命名 ↔ 真实事件 ↔ 语义）
   kind       对应 tracepoint                含义                           层级
   ---------  ---------------------------    ------------------------------  ------
-  sleep      rclcpp_executor_wait_for_work  线程开始进入 wait（空闲开始）    [线程]
-  wake       该 wait 之后下一次
-             rclcpp_executor_get_next_ready 线程从 wait 返回、取到就绪实体   [线程]
-  release    rclcpp_executor_execute        该线程 executor 挑中此 job 的时刻   [节点/轮]
-  execute    rclcpp callback_start          do_work 开始执行               [节点/轮]
-  complete   本节点自己输出话题的发布        本轮干完并对外通知/交给下游       [节点/轮]
-  finished   rclcpp callback_end            回调返回收尾(发布后几 us)        [节点/轮]
+  wake       rclcpp_executor_get_next_ready 线程从 wait 返回、取到就绪实体          [线程]
+  release    rclcpp_executor_execute        该线程 executor 挑中此 job 的时刻      [节点/轮]
+  execute    rclcpp callback_begin          do_work 开始执行                     [节点/轮]
+  complete   rclcpp_publish                 本轮干完并对外通知/交给下游             [节点/轮]
+  finished   rclcpp callback_end            回调返回收尾(发布后几 us)              [节点/轮]
+  sleep      rclcpp_executor_wait_for_work  线程开始进入 wait（空闲开始）           [线程]
 
 时序（按节点一轮）：release ≈ execute → complete(发布) → finished(返回)。
 说明：
@@ -51,8 +50,8 @@ CSV_STATS_DIR = "results"    # 输出的时间线 CSV 放这里
 
 # 要输出的 kind（都可开关）
 INCLUDE_FINISHED = True      # finished = 该轮回调返回收尾（callback_end）；complete=发布=对外通知恒输出
-INCLUDE_RELEASE = True       # release = executor 挑中该 job 的时刻（rclcpp_executor_execute；≈execute）
-INCLUDE_WAKE_SLEEP = True    # wake/sleep（线程级；wake = 醒来后的 get_next_ready）
+INCLUDE_RELEASE = True       # release = rclcpp_callback_dispatch
+INCLUDE_WAKE_SLEEP = True    # wake/sleep（线程级原始 tracing 事件）
 
 # 裁掉 trace 开头的过渡/预热段（单位 us）。
 # test.py 的 WARMUP_TIME=5s，即录制里前 5 秒是预热 → 这里设 5_000_000；
@@ -114,11 +113,11 @@ def analyze(trace_dir, flags, min_us=0.0):
     pub_by_topic = {}         # topic -> [发布时刻 ts]
     pub_events = []           # (ts, publisher_handle, vtid) 数据发布（intra 与 rcl 两种）
     target_pid = None
-    open_job = {}             # (callback, vtid) -> start_ts
-    jobs = []                 # 待归属的 {start_ts, end_ts, vtid, cpu}
+    open_job = {}             # (callback, vtid) -> job
+    jobs = []                 # 待归属的 {start_ts, end_ts, vtid, cpu, callback}
     wait_per_vtid = {}        # vtid -> [(wait_for_work.ts, cpu), ...]
     ready_per_vtid = {}       # vtid -> [(get_next_ready.ts, cpu), ...]
-    exec_per_vtid = {}        # vtid -> [(executor_execute.ts, cpu), ...]
+    dispatch_per_vtid = {}    # vtid -> [(callback_dispatch.ts, cpu), ...]
 
     for e in _iter_events(trace_dir):
         n = e.name
@@ -150,20 +149,26 @@ def analyze(trace_dir, flags, min_us=0.0):
             if h in data_pub2node:
                 pub_events.append((e.ts, h, e.vtid))
                 pub_by_topic.setdefault(data_pub_topic[h], []).append(e.ts)
+        elif n == 'ros2:rclcpp_executor_execute':
+            dispatch_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
         elif n == 'ros2:callback_start':
-            open_job[(e.payload.get('callback'), e.vtid)] = (e.ts, e.cpu)
+            callback = e.payload.get('callback')
+            open_job[(callback, e.vtid)] = {
+                'start_ts': e.ts,
+                'vtid': e.vtid,
+                'cpu': e.cpu,
+                'callback': callback,
+            }
         elif n == 'ros2:callback_end':
             key = (e.payload.get('callback'), e.vtid)
             if key in open_job:
-                st, scpu = open_job.pop(key)
-                jobs.append({'start_ts': st, 'end_ts': e.ts,
-                             'vtid': e.vtid, 'cpu': scpu})
+                job = open_job.pop(key)
+                job['end_ts'] = e.ts
+                jobs.append(job)
         elif n == 'ros2:rclcpp_executor_wait_for_work':
             wait_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
         elif n == 'ros2:rclcpp_executor_get_next_ready':
             ready_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
-        elif n == 'ros2:rclcpp_executor_execute':
-            exec_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
 
     if target_pid is None:
         print('[失败] 未在 trace 中找到 node_nn* 节点初始化事件。'
@@ -188,29 +193,25 @@ def analyze(trace_dir, flags, min_us=0.0):
         if node is None:
             continue
         j['node'] = node
-        j['finish_ts'] = pub_events[k][0]     # 认人用的那次发布 = 该节点“对外通知完成”
+        j['complete_ts'] = pub_events[k][0]     # 认人用的那次发布 = 该节点“对外通知完成”
         labeled.append(j)
 
     if not labeled:
         print('[警告] 未归属到任何节点 job（0 行）。请检查 trace 里是否包含发布事件。')
         return None
 
-    # release = executor 挑中该 job：该线程(vtid)上、execute 之前最近一次 executor_execute。
-    # 注意：executor_execute 并非对每个回调都触发（intra 订阅回调常不走它），
-    # 因此只有“execute 前 ≤ EXEC_WIN_NS 内”的 EXEC 才算本 job 的；否则用 execute 兜底
-    # （release≈execute，符合用户“不关心排队、只要 executor 拿到 job 的时间点”的口径）。
-    EXEC_WIN_NS = 200_000   # 200us
-    exec_ts = {}
-    for vtid, pairs in exec_per_vtid.items():
+    # release = 实际 callback_dispatch 事件。
+    # 仅按同一 vtid、且位于 callback_start 之前的最近 dispatch 关联。
+    dispatch_ts = {}
+    for vtid, pairs in dispatch_per_vtid.items():
         pairs.sort()
-        exec_ts[vtid] = [t for t, _ in pairs]
+        dispatch_ts[vtid] = [t for t, _ in pairs]
+
     for j in labeled:
-        ts_list = exec_ts.get(j['vtid'])
+        ts_list = dispatch_ts.get(j['vtid'], [])
         k = bisect.bisect_right(ts_list, j['start_ts']) if ts_list else 0
-        if k > 0 and (j['start_ts'] - ts_list[k - 1]) <= EXEC_WIN_NS:
+        if k > 0:
             j['release_ts'] = ts_list[k - 1]
-        else:
-            j['release_ts'] = j['start_ts']   # 兜底：无紧邻 EXEC 则取 execute 时刻
 
     return build_rows(labeled, wait_per_vtid, ready_per_vtid, flags, min_us)
 
@@ -220,27 +221,36 @@ def build_rows(jobs, wait_per_vtid, ready_per_vtid, flags, min_us):
     for j in jobs:
         tag = j['node'].replace('node_nn', 'n')
         rows.append((j['start_ts'], j['vtid'], j['cpu'], 'execute', tag))
-        if 'finish_ts' in j:                       # complete = 发布（对外通知完成）
-            rows.append((j['finish_ts'], j['vtid'], j['cpu'], 'complete', tag))
-        if flags.get('finished'):                  # finished = 回调返回收尾
+        if 'complete_ts' in j:                       # complete = callback 内本节点 publish
+            rows.append((j['complete_ts'], j['vtid'], j['cpu'], 'complete', tag))
+        if flags.get('finished'):                  # finished = callback_end
             rows.append((j['end_ts'], j['vtid'], j['cpu'], 'finished', tag))
         if flags.get('release') and 'release_ts' in j:
             rows.append((j['release_ts'], j['vtid'], j['cpu'], 'release', tag))
 
     if flags['wake_sleep']:
-        job_vtids = {j['vtid'] for j in jobs}
-        for vtid in job_vtids:
-            waits = sorted(wait_per_vtid.get(vtid, []))     # [(ts, cpu), ...]
-            readys = sorted(ready_per_vtid.get(vtid, []))   # [(ts, cpu), ...]
-            rts = [t for t, _ in readys]
-            for w, cpu in waits:
-                rows.append((w, vtid, cpu, 'sleep', ''))
-            # wake = 该线程 sleep 之后下一次 get_next_ready（真正醒来取到活儿）
-            for w, _ in waits:
-                k = bisect.bisect_right(rts, w)
-                if k < len(readys):
-                    rt, rcpu = readys[k]
-                    rows.append((rt, vtid, rcpu, 'wake', ''))
+        # sleep/wake 是线程级原始事件，与 callback jobs 独立。
+        # 即使线程没有执行任何 callback，也保留完整的 sleep/wake 序列。
+        thread_vtids = set(wait_per_vtid) | set(ready_per_vtid)
+
+        for vtid in thread_vtids:
+            waits = wait_per_vtid.get(vtid, [])
+            readys = ready_per_vtid.get(vtid, [])
+
+            events = (
+                    [(ts, cpu, 'wait') for ts, cpu in waits] +
+                    [(ts, cpu, 'ready') for ts, cpu in readys]
+            )
+            events.sort(key=lambda x: x[0])
+
+            waiting = False
+            for ts, cpu, kind in events:
+                if kind == 'wait':
+                    rows.append((ts, vtid, cpu, 'sleep', ''))
+                    waiting = True
+                elif kind == 'ready' and waiting:
+                    rows.append((ts, vtid, cpu, 'wake', ''))
+                    waiting = False
 
     if not rows:
         return None
@@ -249,15 +259,17 @@ def build_rows(jobs, wait_per_vtid, ready_per_vtid, flags, min_us):
     for ts, vtid, cpu, kind, tag in rows:
         if (ts - t0) / 1000.0 >= min_us:  # 裁掉预热/启动过渡段
             cand.append((ts, vtid, cpu, kind, tag))
+
     by_tid = {}
     for ts, vtid, cpu, kind, tag in cand:
         by_tid.setdefault(vtid, []).append((ts, cpu, kind, tag))
+
+    # 输出顺序：按 tid 聚合（相同 tid 相邻），组内按真实时间升序；
+    # seq = 该 tid 内按时间递增的序号。不再全局时间穿插 → 跨线程不再交错难读。
     flat = []
     for vtid in sorted(by_tid):
-        # seq 仍是“该 tid 内按时间递增”的序号
         for seq, (ts, cpu, kind, tag) in enumerate(sorted(by_tid[vtid])):
             flat.append([vtid, seq, kind, round((ts - t0) / 1000.0, 3), cpu, tag])
-    flat.sort(key=lambda r: r[3])          # 全局按 t_us 升序输出
     return flat
 
 
@@ -317,3 +329,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
