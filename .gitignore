@@ -1,0 +1,85 @@
+# User Define
+.idea
+!**idea/copyright*
+cmake-build*
+Build*
+Bin*
+*Data*
+*venv*
+.vscode
+.cache
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+bin/
+
+
+# Token
+token.txt
+
+# Python Cache
+__pycache__/
+
+# Dataset images
+*.png
+*.csv
+*.jpg
+.json
+!logo.png
+pyconfig.json
+yolov8n.pt
+yolov8n-seg.pt
+yolov8n-pose.pt
+yolov8n-cls.pt
+yolov8n-obb.pt
+*:Zone.Identifier
+code_collector.py
+code_collector.md
+
+*/reports/*
+*/results/*
+*/pipelines/*
+*/launches/*
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.so
+*.o
+*.obj
+client
+server
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Static libraries
+*.a
+!libzenohc.a
+
+# Executables
+*.exe
+*.out
+*.app
+
+# log
+*.log
+
+!*.cpp
+
+# ros
+install/
+log/
+build/
+resource/
+test/
+/memory/
+/memory/FACT.md
+/memory/JOURNAL.jsonl
+/plugins/
+*.json
