@@ -21,6 +21,10 @@ public:
         auto inputs = this->get_parameter("input_topics").as_string_array();
         auto outputs = this->get_parameter("output_topics").as_string_array();
 
+        // 创建 Reentrant callback group
+        callback_group_ = this->create_callback_group(
+            rclcpp::CallbackGroupType::Reentrant);
+
         for (const auto& t : outputs) {
             pubs_.push_back(this->create_publisher<std_msgs::msg::String>(t, 10));
         }
@@ -28,14 +32,18 @@ public:
         if (period_ms > 0) {
             timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(period_ms),
-                std::bind(&SimComponent::do_work, this));
+                std::bind(&SimComponent::do_work, this),
+                callback_group_);
         } else {
             for (const auto& t : inputs) {
+                rclcpp::SubscriptionOptions options;
+                options.callback_group = callback_group_;
+
                 subs_.push_back(this->create_subscription<std_msgs::msg::String>(
                     t, 10, [this](std_msgs::msg::String::SharedPtr msg) {
                         (void)msg;
                         this->do_work();
-                    }));
+                    }, options));
             }
         }
     }
@@ -59,6 +67,7 @@ private:
     int wcet_us_;
     std::vector<rclcpp::Publisher<std_msgs::msg::String>::SharedPtr> pubs_;
     std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> subs_;
+    rclcpp::CallbackGroup::SharedPtr callback_group_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 
