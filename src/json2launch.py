@@ -1,38 +1,48 @@
+import argparse
 import json
 import os
 import glob
 import re
 
 # ================= 配置区 =================
-INPUT_DIR = "./pipelines"
-OUTPUT_DIR = "./launches"
-PACKAGE_NAME = "eval"
-COMPONENT_NAME = "eval::SimComponent"
-
-# 组件容器所在包与可执行文件（自定义容器 usr_container 会读 num_threads 参数，
-# 使文件名中的 m 真正决定 executor 线程数）
-CONTAINER_PACKAGE = "eval"
-CONTAINER_EXECUTABLE = "usr_container"
-
-# ====== Executor 配置 ======
-# 可选值:
-#   - "MultiThreadedExecutor"      # ROS 2 标准多线程执行器
-#   - "SingleThreadedExecutor"     # ROS 2 标准单线程执行器（不支持）
-#   - "EventsExecutor"             # ROS 2 实验性事件驱动执行器（不支持）
-#   - "CallbackIsolatedExecutor"   # Autoware 的回调隔离执行器（每个回调组独立线程）
-# 线程配置（仅对 MultiThreadedExecutor 和 CallbackIsolatedExecutor 有效）
-# - MultiThreadedExecutor: 线程池大小
-# - CallbackIsolatedExecutor: 每个回调组独立线程，此值用于限制最大并发数
-EXECUTOR_TYPE = "MultiThreadedExecutor"
-
-# USE_INTRAPROCESS: 是否启用 ROS 2 内部进程通信（intra-process communication）
+INPUT_DIR = "./result/CIE_FIFO_IPC_nuc12"
+OUTPUT_DIR = "./result/CIE_FIFO_IPC_nuc12"
+# USE_INTRAPROCESS: 是否启用 ROS 2 内部进程通信
 USE_INTRAPROCESS = True
 
+# ====== Executor 选择 ======
+# 可选值:
+#   - "MTE"   # MultiThreadedExecutor (使用 usr_container)
+#   - "CIE"   # CallbackIsolatedExecutor (使用 cie_container)
+EXECUTOR_TYPE = "CIE"  # 修改这里切换执行器
+
+# ====== Executor 配置映射 ======
+# 根据 EXECUTOR_TYPE 自动选择对应的包、组件和容器
+EXECUTOR_CONFIG = {
+    "MTE": {
+        "package": "eval_mte",           # MTE 包名
+        "component": "eval::MTEComponent",  # MTE 组件名（与 mte_component.cpp 注册一致）
+        "executable": "mte_container",   # MTE 容器
+        "note": "MultiThreadedExecutor (标准多线程执行器)"
+    },
+    "CIE": {
+        "package": "eval_cie",           # CIE 包名
+        "component": "eval::CIEComponent",  # CIE 组件名
+        "executable": "cie_container",   # CIE 容器
+        "note": "CallbackIsolatedExecutor (回调隔离执行器)"
+    }
+}
+
+# 获取当前执行器配置
+CURRENT_CONFIG = EXECUTOR_CONFIG[EXECUTOR_TYPE]
+PACKAGE_NAME = CURRENT_CONFIG["package"]
+COMPONENT_NAME = CURRENT_CONFIG["component"]
+CONTAINER_EXECUTABLE = CURRENT_CONFIG["executable"]
+
 # ====== CallbackIsolatedExecutor 专用配置 ======
-# CIE 线程配置（如果未提供配置文件，则使用这些默认值）
-CIE_THREAD_PRIORITY = 50                # 线程优先级 (0-99, 仅对 SCHED_FIFO/RR 有效)
-CIE_THREAD_SCHED_POLICY = "SCHED_FIFO"  # 可选: "SCHED_FIFO", "SCHED_RR", "SCHED_OTHER"
-CIE_CPU_AFFINITY = []                   # CPU 亲和性，例如 [0, 1] 表示绑定到 CPU 0 和 1
+CIE_THREAD_PRIORITY = 50
+CIE_THREAD_SCHED_POLICY = "SCHED_OTHER"  # "SCHED_FIFO", "SCHED_RR", "SCHED_OTHER"
+CIE_CPU_AFFINITY = [0, 1, 2]
 # ===========================================
 
 # ====== QoS 配置 ======
@@ -43,6 +53,28 @@ QOS_DURABILITY = "volatile"
 QOS_DEADLINE = 0
 QOS_LIFESPAN = 0
 # ==========================
+
+def apply_executor(executor_type):
+    """按 executor 类型刷新派生的包/组件/容器常量（支持 CLI 切换）。"""
+    global EXECUTOR_TYPE, CURRENT_CONFIG, PACKAGE_NAME, COMPONENT_NAME, \
+        CONTAINER_EXECUTABLE
+    EXECUTOR_TYPE = executor_type
+    CURRENT_CONFIG = EXECUTOR_CONFIG[executor_type]
+    PACKAGE_NAME = CURRENT_CONFIG["package"]
+    COMPONENT_NAME = CURRENT_CONFIG["component"]
+    CONTAINER_EXECUTABLE = CURRENT_CONFIG["executable"]
+
+
+def parse_args():
+    """命令行参数：一键切换 executor 与输入/输出目录。"""
+    p = argparse.ArgumentParser(
+        description="把 json 任务图生成 launch（默认 CIE，可切 MTE）")
+    p.add_argument("--executor", choices=["CIE", "MTE"],
+                   default=None, help="executor 类型（默认取模块常量 EXECUTOR_TYPE）")
+    p.add_argument("--input", default=None, help="json 所在目录")
+    p.add_argument("--output", default=None, help="launch 输出目录")
+    return p.parse_args()
+
 
 def parse_m_from_filename(filename):
     match = re.search(r'_m(\d+)', filename)
@@ -57,50 +89,19 @@ def parse_m_from_filename(filename):
 
 def get_executor_config(m_value):
     """根据 m 值和执行器类型返回配置"""
+    threads = m_value if m_value > 0 else os.cpu_count()
+
     config = {
-        "threads": 1,
-        "note": "",
-        "executable": "component_container"
+        "threads": threads,
+        "executable": CONTAINER_EXECUTABLE,
+        "note": f"{CURRENT_CONFIG['note']}，使用 {threads} 个线程 (m={m_value})",
+        "is_cie": (EXECUTOR_TYPE == "CIE")
     }
-
-    if EXECUTOR_TYPE == "SingleThreadedExecutor":
-        config["threads"] = 1
-        config["note"] = f"单线程执行器，m={m_value} 被忽略"
-        config["executable"] = "component_container"
-
-    elif EXECUTOR_TYPE == "MultiThreadedExecutor":
-        threads = m_value if m_value > 0 else os.cpu_count()
-        config["threads"] = threads
-        config["note"] = f"多线程执行器，使用 {threads} 个线程 (m={m_value})"
-        config["executable"] = CONTAINER_EXECUTABLE  # usr_container 按 num_threads 起线程
-
-    elif EXECUTOR_TYPE == "EventsExecutor":
-        config["threads"] = 1  # 目前官方版本是单线程
-        config["note"] = f"事件驱动执行器（实验性），目前为单线程，m={m_value} 被忽略"
-        config["executable"] = "component_container"  # 使用普通容器
-
-    elif EXECUTOR_TYPE == "CallbackIsolatedExecutor":
-        threads = m_value if m_value > 0 else os.cpu_count()
-        config["threads"] = threads
-        config["note"] = f"回调隔离执行器 (CIE)，每个回调组独立线程，最大并发数 {threads} (m={m_value})"
-        config["executable"] = "component_container_mt"  # CIE 基于多线程容器
-        config["cie_enabled"] = True
-
-    else:
-        # 默认回退到 MultiThreadedExecutor
-        threads = m_value if m_value > 0 else os.cpu_count()
-        config["threads"] = threads
-        config["note"] = f"未知执行器类型，回退到多线程执行器，使用 {threads} 个线程"
-        config["executable"] = CONTAINER_EXECUTABLE  # 同上，按 num_threads 起线程
 
     return config
 
 def _fmt_number(value):
-    """整数值按 int 输出。
-
-    sim_node.cpp 的参数用 declare_parameter(x, 0) 声明为整型；若生成的 launch
-    里写成 100.0（double），组件加载时会被判为类型不匹配而抛异常、节点起不来。
-    这里把整数形式的浮点归一成 int。"""
+    """整数值按 int 输出"""
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
@@ -129,6 +130,9 @@ def fins_json_to_component_launch(json_path, launch_path):
         "",
         "# ===== Executor 配置 =====",
         f"# 类型: {EXECUTOR_TYPE}",
+        f"# 包名: {PACKAGE_NAME}",
+        f"# 组件: {COMPONENT_NAME}",
+        f"# 可执行文件: {executor_config['executable']}",
         f"# 文件名: {filename}",
         f"# m值: {m_value}",
         f"# 说明: {executor_config['note']}",
@@ -146,42 +150,30 @@ def fins_json_to_component_launch(json_path, launch_path):
         "def generate_launch_description():",
     ]
 
-    # 根据执行器类型添加不同的导入和配置
-    if EXECUTOR_TYPE == "CallbackIsolatedExecutor":
+    # 根据执行器类型构建容器参数
+    if executor_config["is_cie"]:
         content.extend([
             "    # 使用 CallbackIsolatedExecutor (CIE)",
-            "    # 需要安装: https://github.com/autowarefoundation/callback_isolated_executor",
-            "    try:",
-            "        from callback_isolated_executor import create_container_with_cie",
-            "        use_cie = True",
-            "    except ImportError:",
-            "        print('Warning: callback_isolated_executor not found, falling back to standard container')",
-            "        use_cie = False",
-            "",
-            "    # 如果没有 CIE，使用标准多线程容器",
-            "    if use_cie:",
-            "        # CIE 需要配置线程参数",
-            "        cie_config = {",
-            "            'thread_priority': {CIE_THREAD_PRIORITY},",
-            f"            'sched_policy': '{CIE_THREAD_SCHED_POLICY}',",
-            f"            'cpu_affinity': {CIE_CPU_AFFINITY if CIE_CPU_AFFINITY else 'None'},",
-            "            'max_concurrent_callbacks': {executor_config['threads']}",
-            "        }",
-            "        container = create_container_with_cie(",
-            "            name='fins_eval_container',",
-            "            namespace='',",
-            "            package='rclcpp_components',",
-            f"            executable='{executor_config['executable']}',",
-            "            composable_node_descriptions=[",
+            f"    container = ComposableNodeContainer(",
+            "        name='fins_eval_container',",
+            "        namespace='',",
+            f"        package='{PACKAGE_NAME}',",
+            f"        executable='{executor_config['executable']}',",
+            "        parameters=[{",
+            f"            'num_threads': {executor_config['threads']},",
+            f"            'thread_priority': {CIE_THREAD_PRIORITY},",
+            f"            'scheduler_policy': '{CIE_THREAD_SCHED_POLICY}',",
+            f"            'cpu_affinity': {CIE_CPU_AFFINITY if CIE_CPU_AFFINITY else []}",
+            "        }],",
+            "        composable_node_descriptions=[",
         ])
     else:
-        # 标准执行器
         content.extend([
-            f"    # {EXECUTOR_TYPE}",
+            f"    # {CURRENT_CONFIG['note']}",
             "    container = ComposableNodeContainer(",
             "        name='fins_eval_container',",
             "        namespace='',",
-            f"        package='{CONTAINER_PACKAGE}',",
+            f"        package='{PACKAGE_NAME}',",
             f"        executable='{executor_config['executable']}',",
             f"        parameters=[{{'num_threads': {executor_config['threads']}}}],",
             "        composable_node_descriptions=[",
@@ -203,17 +195,6 @@ def fins_json_to_component_launch(json_path, launch_path):
         if "loop" in node_cfg and node_cfg["loop"]:
             acc_window = list(node_cfg["loop"].values())[0]
 
-        # 为 CIE 添加回调组配置
-        if EXECUTOR_TYPE == "CallbackIsolatedExecutor":
-            callback_group = """        callback_group='callback_group',
-        callback_group_kwargs={'mutually_exclusive': False},
-"""
-        else:
-            callback_group = ""
-
-        # input/output topics 只在非空时才写进参数表。
-        # launch 解析到空列表会当成空 tuple，报 "Expected 'value' ... got '()'" 中止；
-        # sim_node.cpp 已用 declare_parameter 声明默认空数组，留空即省略键，语义不变。
         _tind = "                        "
         topics_block = ""
         if inputs:
@@ -224,12 +205,13 @@ def fins_json_to_component_launch(json_path, launch_path):
         node_entry = f"""            ComposableNode(
                 package='{PACKAGE_NAME}',
                 plugin='{COMPONENT_NAME}',
-                name='node_n{node_id}',
+                name='{node_id}',
                 parameters=[
                     {{
                         'wcet_us': {wcet_us},
                         'period_ms': {period_ms},
-{topics_block}                        'acc_window': {acc_window}
+{topics_block}                        'acc_window': {acc_window},
+                        'node_id': '{node_id}'
                     }},
                     {{
                         'qos_reliability': '{QOS_RELIABILITY}',
@@ -241,45 +223,42 @@ def fins_json_to_component_launch(json_path, launch_path):
                     }}
                 ],
                 extra_arguments=[{{'use_intra_process_comms': {USE_INTRAPROCESS}}}],
-                {callback_group}),"""
+            ),"""
         content.append(node_entry)
 
     # 封底
-    if EXECUTOR_TYPE == "CallbackIsolatedExecutor":
-        content.extend([
-            "            ],",
-            "            cie_config=cie_config",
-            "        )",
-            "    else:",
-            "        # Fallback 到标准多线程容器",
-            "        container = ComposableNodeContainer(",
-            "            name='fins_eval_container',",
-            "            namespace='',",
-            "            package='rclcpp_components',",
-            f"            executable='{executor_config['executable']}',",
-            "            composable_node_descriptions=composable_nodes,",
-            "            output='screen'",
-            "        )",
-            "    return launch.LaunchDescription([container])"
-        ])
-    else:
-        content.extend([
-            "        ],",
-            "        output='screen',",
-            f"        # Executor: {EXECUTOR_TYPE}, Threads: {executor_config['threads']}",
-            "    )",
-            "    return launch.LaunchDescription([container])"
-        ])
+    content.extend([
+        "        ],",
+        "        output='screen',",
+        f"        # Executor: {EXECUTOR_TYPE}, Threads: {executor_config['threads']}",
+        "    )",
+        "    return launch.LaunchDescription([container])"
+    ])
 
     with open(launch_path, 'w') as f:
         f.write("\n".join(content))
 
 def main():
+    args = parse_args()
+    # CLI 覆盖模块常量（默认仍是配置区里的值）
+    global INPUT_DIR, OUTPUT_DIR
+    executor = args.executor if args.executor else EXECUTOR_TYPE
+    input_dir = args.input if args.input else INPUT_DIR
+    output_dir = args.output if args.output else OUTPUT_DIR
+    INPUT_DIR, OUTPUT_DIR = input_dir, output_dir
+    apply_executor(executor)
+
+    # 验证执行器类型
+    if EXECUTOR_TYPE not in EXECUTOR_CONFIG:
+        print(f"[Error] 无效的执行器类型: {EXECUTOR_TYPE}")
+        print(f"可选值: {list(EXECUTOR_CONFIG.keys())}")
+        return
+
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         print(f"Created directory: {OUTPUT_DIR}")
 
-    json_files = glob.glob(os.path.join(INPUT_DIR, "feedback_*.json"))
+    json_files = glob.glob(os.path.join(INPUT_DIR, "*.json"))
 
     if not json_files:
         print("No FINS JSON files found!")
@@ -287,8 +266,11 @@ def main():
 
     print(f"Starting conversion of {len(json_files)} files...")
     print(f"Executor type: {EXECUTOR_TYPE}")
+    print(f"Package: {PACKAGE_NAME}")
+    print(f"Component: {COMPONENT_NAME}")
+    print(f"Executable: {CONTAINER_EXECUTABLE}")
     print(f"Intra-process communication: {USE_INTRAPROCESS}")
-    if EXECUTOR_TYPE == "CallbackIsolatedExecutor":
+    if EXECUTOR_TYPE == "CIE":
         print(f"CIE Priority: {CIE_THREAD_PRIORITY}")
         print(f"CIE Schedule Policy: {CIE_THREAD_SCHED_POLICY}")
         print(f"CIE CPU Affinity: {CIE_CPU_AFFINITY if CIE_CPU_AFFINITY else 'Not Set'}")

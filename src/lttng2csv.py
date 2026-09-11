@@ -1,37 +1,23 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """批量把 reports/ 下每个实验的 ros2_tracing trace 导出为“事件时间线” CSV。
 
-列：tid, seq, kind, t_us, cpu, tag
+列：tid, seq, kind, t_us, cpu, tag（输出按 cpu/core 聚合，组内按时间排序）
 
 【kind 与 ROS tracepoint 的对应关系】（我们命名 ↔ 真实事件 ↔ 语义）
   kind       对应 tracepoint                含义                           层级
   ---------  ---------------------------    ------------------------------  ------
   wake       rclcpp_executor_get_next_ready 线程从 wait 返回、取到就绪实体          [线程]
-  release    rclcpp_executor_execute        该线程 executor 挑中此 job 的时刻      [节点/轮]
-  execute    rclcpp callback_begin          do_work 开始执行                     [节点/轮]
-  complete   rclcpp_publish                 本轮干完并对外通知/交给下游             [节点/轮]
-  finished   rclcpp callback_end            回调返回收尾(发布后几 us)              [节点/轮]
+  release
+  -> !IPC    rclcpp_executor_execute        该线程 executor 挑中此 job 的时刻      [节点/轮]
+  -> IPC     rclcpp:callback_start          ~ 该线程 executor 挑中此 job 的时刻    [节点/轮]
+  execute    eval:algo_execute[自定义]       do_work 执行（已经收到数据）           [节点/轮]
+  complete   eval:algo_complete[自定义]      do_work 算完（尚未发布完毕）           [节点/轮]
+  finished   rclcpp:callback_end            回调返回收尾                          [节点/轮]
   sleep      rclcpp_executor_wait_for_work  线程开始进入 wait（空闲开始）           [线程]
 
-时序（按节点一轮）：release ≈ execute → complete(发布) → finished(返回)。
-说明：
-  - complete(发布) = 对外通知/交给下游，是跨节点“每轮”边界（算 makespan 用 complete）。
-  - release 现指 executor 挑中该 job 的时刻，不代表上游到达，release≈execute（仅差
-    executor 开销），因此不体现“在就绪队列等待”的时间。
-注意：
-  - sleep/wake 是“工作线程”的忙闲，不属于节点的一轮；一个忙期可连跑多个 job 才 sleep。
-  - 一个节点一轮的完整执行 = [execute, finished]；对外边界(给下游/算 makespan)用 complete。
-
-节点(tag)归属：do_work 只在自己线程上发布自己的输出话题 → 用“回调窗口内 + 同 vtid
-的发布”认人（多线程窗口重叠、intra-process 下依然成立）。
-前置条件：录制覆盖节点加载（ros2 trace start 先于 ros2 launch），否则 tag 无法解析。
-
-用法：改下方配置区后直接运行 python3 lttng2csv.py；
-可选 CLI 覆盖：--results / --outdir / --finished / --release / --wake-sleep / --after-us
+  注意： IPC 下 release -> execute 延迟低但并不能说明算法包装成本低，仅仅是原生框架里不方便取到 execute 的时刻，所以才用 callback_start 代替。
 """
+
 import argparse
-import bisect
 import csv
 import glob
 import os
@@ -45,22 +31,19 @@ import bt2
 # 所有参数都集中在这里改，然后直接运行：python3 lttng2csv.py
 # ------------------------------------------------------------
 # 实验与输出目录
-RESULTS_DIR = "reports"      # 每个实验一个文件夹（含 trace/ 子目录）
-CSV_STATS_DIR = "results"    # 输出的时间线 CSV 放这里
+RESULTS_DIR = "./result/CIE_FIFO_IPC_nuc12"      # 每个实验一个文件夹（含 trace/ 子目录）
+
+# USE_INTRAPROCESS: 是否启用 ROS 2 内部进程通信
+USE_INTRAPROCESS = True
 
 # 要输出的 kind（都可开关）
 INCLUDE_FINISHED = True      # finished = 该轮回调返回收尾（callback_end）；complete=发布=对外通知恒输出
 INCLUDE_RELEASE = True       # release = rclcpp_callback_dispatch
 INCLUDE_WAKE_SLEEP = True    # wake/sleep（线程级原始 tracing 事件）
 
-# 裁掉 trace 开头的过渡/预热段（单位 us）。
-# test.py 的 WARMUP_TIME=5s，即录制里前 5 秒是预热 → 这里设 5_000_000；
-# 想保留全部就设 0。
-AFTER_US = 5_000_000
+# 裁掉 trace 开头的预热段（单位 us）
+AFTER_US = 2000 * 1000  # 2 seconds (test.py trace 启动需要 1.5s)
 # ==========================================
-
-# SimComponent 的数据话题（p 输出形如 p<节点><下标>_<边>）
-_DATA_TOPIC = re.compile(r'^/p\d+_\d+$')
 
 
 def _val(field):
@@ -105,171 +88,88 @@ def _iter_events(trace_dir):
         yield EventView(ev, msg)
 
 
-def analyze(trace_dir, flags, min_us=0.0):
-    node_handle2name = {}     # node_handle -> 'node_nn<i>'
-    data_pub2node = {}        # data publisher_handle -> node name
-    data_pub_topic = {}       # data publisher_handle -> topic
-    node_sub_inputs = {}      # node_name -> set(输入数据话题)
-    pub_by_topic = {}         # topic -> [发布时刻 ts]
-    pub_events = []           # (ts, publisher_handle, vtid) 数据发布（intra 与 rcl 两种）
-    target_pid = None
-    open_job = {}             # (callback, vtid) -> job
-    jobs = []                 # 待归属的 {start_ts, end_ts, vtid, cpu, callback}
-    wait_per_vtid = {}        # vtid -> [(wait_for_work.ts, cpu), ...]
-    ready_per_vtid = {}       # vtid -> [(get_next_ready.ts, cpu), ...]
-    dispatch_per_vtid = {}    # vtid -> [(callback_dispatch.ts, cpu), ...]
+def analyze(trace_dir, min_us=0.0):
+    rows = []
 
     for e in _iter_events(trace_dir):
         n = e.name
-        if n == 'ros2:rcl_node_init':
-            nm = e.payload.get('node_name')
-            if isinstance(nm, str) and nm.startswith('node_nn'):
-                node_handle2name[e.payload['node_handle']] = nm
-                if target_pid is None:
-                    target_pid = e.vpid
-            continue
-        if target_pid is not None and e.vpid != target_pid:
-            continue
 
-        if n == 'ros2:rcl_publisher_init':
-            nh = e.payload.get('node_handle')
-            topic = e.payload.get('topic_name')
-            nm = node_handle2name.get(nh)
-            if nm and isinstance(topic, str) and _DATA_TOPIC.match(topic):
-                data_pub2node[e.payload['publisher_handle']] = nm
-                data_pub_topic[e.payload['publisher_handle']] = topic
-        elif n == 'ros2:rcl_subscription_init':
-            nh = e.payload.get('node_handle')
-            topic = e.payload.get('topic_name')
-            nm = node_handle2name.get(nh)
-            if nm and isinstance(topic, str) and _DATA_TOPIC.match(topic):
-                node_sub_inputs.setdefault(nm, set()).add(topic)
-        elif n in ('ros2:rclcpp_intra_publish', 'ros2:rcl_publish'):
-            h = e.payload.get('publisher_handle')
-            if h in data_pub2node:
-                pub_events.append((e.ts, h, e.vtid))
-                pub_by_topic.setdefault(data_pub_topic[h], []).append(e.ts)
-        elif n == 'ros2:rclcpp_executor_execute':
-            dispatch_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
-        elif n == 'ros2:callback_start':
-            callback = e.payload.get('callback')
-            open_job[(callback, e.vtid)] = {
-                'start_ts': e.ts,
-                'vtid': e.vtid,
-                'cpu': e.cpu,
-                'callback': callback,
-            }
-        elif n == 'ros2:callback_end':
-            key = (e.payload.get('callback'), e.vtid)
-            if key in open_job:
-                job = open_job.pop(key)
-                job['end_ts'] = e.ts
-                jobs.append(job)
-        elif n == 'ros2:rclcpp_executor_wait_for_work':
-            wait_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
-        elif n == 'ros2:rclcpp_executor_get_next_ready':
-            ready_per_vtid.setdefault(e.vtid, []).append((e.ts, e.cpu))
+        if n == 'eval:algo_execute':
+            kind = 'execute'
+            tag = e.payload.get('node_id', '')
 
-    if target_pid is None:
-        print('[失败] 未在 trace 中找到 node_nn* 节点初始化事件。'
-              '请确认录制覆盖了 ros2 launch（先 ros2 trace start 再 launch）。')
-        return None
+        elif n == 'eval:algo_complete':
+            kind = 'complete'
+            tag = e.payload.get('node_id', '')
 
-    # 归属：do_work 只在自己线程上发布自己的输出话题 → 窗口内 + vtid 相同的发布认人
-    pub_events.sort()
-    pub_ts = [p[0] for p in pub_events]
-    labeled = []
-    for j in jobs:
-        lo = bisect.bisect_right(pub_ts, j['start_ts'])
-        hi = bisect.bisect_right(pub_ts, j['end_ts'])
-        node = None
-        for k in range(lo, hi):
-            if pub_events[k][2] != j['vtid']:
-                continue
-            nm = data_pub2node.get(pub_events[k][1])
-            if nm:
-                node = nm
-                break
-        if node is None:
-            continue
-        j['node'] = node
-        j['complete_ts'] = pub_events[k][0]     # 认人用的那次发布 = 该节点“对外通知完成”
-        labeled.append(j)
+        elif n == 'sched_switch':
+            kind = 'switch'
 
-    if not labeled:
-        print('[警告] 未归属到任何节点 job（0 行）。请检查 trace 里是否包含发布事件。')
-        return None
+            prev_tid = e.payload.get('prev_tid', '')
+            next_tid = e.payload.get('next_tid', '')
+            prev_comm = e.payload.get('prev_comm', '')
+            next_comm = e.payload.get('next_comm', '')
+            prev_state = e.payload.get('prev_state', '')
 
-    # release = 实际 callback_dispatch 事件。
-    # 仅按同一 vtid、且位于 callback_start 之前的最近 dispatch 关联。
-    dispatch_ts = {}
-    for vtid, pairs in dispatch_per_vtid.items():
-        pairs.sort()
-        dispatch_ts[vtid] = [t for t, _ in pairs]
-
-    for j in labeled:
-        ts_list = dispatch_ts.get(j['vtid'], [])
-        k = bisect.bisect_right(ts_list, j['start_ts']) if ts_list else 0
-        if k > 0:
-            j['release_ts'] = ts_list[k - 1]
-
-    return build_rows(labeled, wait_per_vtid, ready_per_vtid, flags, min_us)
-
-
-def build_rows(jobs, wait_per_vtid, ready_per_vtid, flags, min_us):
-    rows = []
-    for j in jobs:
-        tag = j['node'].replace('node_nn', 'n')
-        rows.append((j['start_ts'], j['vtid'], j['cpu'], 'execute', tag))
-        if 'complete_ts' in j:                       # complete = callback 内本节点 publish
-            rows.append((j['complete_ts'], j['vtid'], j['cpu'], 'complete', tag))
-        if flags.get('finished'):                  # finished = callback_end
-            rows.append((j['end_ts'], j['vtid'], j['cpu'], 'finished', tag))
-        if flags.get('release') and 'release_ts' in j:
-            rows.append((j['release_ts'], j['vtid'], j['cpu'], 'release', tag))
-
-    if flags['wake_sleep']:
-        # sleep/wake 是线程级原始事件，与 callback jobs 独立。
-        # 即使线程没有执行任何 callback，也保留完整的 sleep/wake 序列。
-        thread_vtids = set(wait_per_vtid) | set(ready_per_vtid)
-
-        for vtid in thread_vtids:
-            waits = wait_per_vtid.get(vtid, [])
-            readys = ready_per_vtid.get(vtid, [])
-
-            events = (
-                    [(ts, cpu, 'wait') for ts, cpu in waits] +
-                    [(ts, cpu, 'ready') for ts, cpu in readys]
+            tag = (
+                f'{prev_comm}[{prev_tid}] -> '
+                f'{next_comm}[{next_tid}]'
             )
-            events.sort(key=lambda x: x[0])
 
-            waiting = False
-            for ts, cpu, kind in events:
-                if kind == 'wait':
-                    rows.append((ts, vtid, cpu, 'sleep', ''))
-                    waiting = True
-                elif kind == 'ready' and waiting:
-                    rows.append((ts, vtid, cpu, 'wake', ''))
-                    waiting = False
+
+        elif n == 'ros2:callback_end':
+            kind = 'finished'
+            tag = ''
+
+        elif not USE_INTRAPROCESS and n == 'ros2:rclcpp_executor_execute':
+            kind = 'release'
+            tag = ''
+
+        elif USE_INTRAPROCESS and n == 'ros2:callback_start':
+            kind = 'release'
+            tag = ''
+
+        elif n == 'ros2:rclcpp_executor_wait_for_work':
+            kind = 'sleep'
+            tag = ''
+
+        elif n == 'ros2:rclcpp_executor_get_next_ready':
+            kind = 'wake'
+            tag = ''
+
+        else:
+            continue
+
+        rows.append((
+            e.ts,
+            e.vtid,
+            e.cpu,
+            kind,
+            tag,
+        ))
 
     if not rows:
         return None
-    t0 = min(r[0] for r in rows)          # trace 起点（时间对齐基准）
+
+    t0 = min(r[0] for r in rows)
+
     cand = []
     for ts, vtid, cpu, kind, tag in rows:
-        if (ts - t0) / 1000.0 >= min_us:  # 裁掉预热/启动过渡段
+        if (ts - t0) / 1000.0 >= min_us:
             cand.append((ts, vtid, cpu, kind, tag))
 
-    by_tid = {}
-    for ts, vtid, cpu, kind, tag in cand:
-        by_tid.setdefault(vtid, []).append((ts, cpu, kind, tag))
-
-    # 输出顺序：按 tid 聚合（相同 tid 相邻），组内按真实时间升序；
-    # seq = 该 tid 内按时间递增的序号。不再全局时间穿插 → 跨线程不再交错难读。
     flat = []
-    for vtid in sorted(by_tid):
-        for seq, (ts, cpu, kind, tag) in enumerate(sorted(by_tid[vtid])):
-            flat.append([vtid, seq, kind, round((ts - t0) / 1000.0, 3), cpu, tag])
+    for seq, (ts, vtid, cpu, kind, tag) in enumerate(cand):
+
+        flat.append([
+            vtid,
+            seq,
+            kind,
+            round((ts - t0) / 1000.0, 3),
+            cpu,
+            tag,
+        ])
+
     return flat
 
 
@@ -280,9 +180,9 @@ def export_one(folder, outdir, flags, after_us):
         return None, "没有 trace/ 子目录"
 
     name = os.path.basename(folder)
-    rows = analyze(trace_path, flags, min_us=after_us)
+    rows = analyze(trace_path, min_us=after_us)
     if rows is None:
-        return None, "解析失败（trace 需覆盖节点加载：先 ros2 trace start 再 launch）"
+        return None, "解析失败（请确认 trace 中是否包含 eval:algo_execute/algo_complete）"
 
     out = os.path.join(outdir, f"{name}_timeline.csv")
     with open(out, 'w', newline='') as f:
@@ -294,8 +194,8 @@ def export_one(folder, outdir, flags, after_us):
 
 def main():
     ap = argparse.ArgumentParser(description='批量导出 reports/ 各实验的时间线 CSV')
-    ap.add_argument('--results', default=RESULTS_DIR, help='实验结果目录（默认 reports）')
-    ap.add_argument('--outdir', default=CSV_STATS_DIR, help='CSV 输出目录（默认 results）')
+    ap.add_argument('--results', default=RESULTS_DIR, help='实验结果目录')
+    ap.add_argument('--outdir', default=RESULTS_DIR, help='CSV 输出目录')
     ap.add_argument('--finished', action='store_true', default=INCLUDE_FINISHED)
     ap.add_argument('--release', action='store_true', default=INCLUDE_RELEASE)
     ap.add_argument('--wake-sleep', action='store_true', default=INCLUDE_WAKE_SLEEP)
@@ -310,9 +210,15 @@ def main():
           f" finished={flags['finished']}, release={flags['release']},"
           f" wake_sleep={flags['wake_sleep']}, after_us={args.after_us:g}")
 
-    folders = sorted(glob.glob(os.path.join(args.results, "feedback_*")))
+    folders = sorted(glob.glob(os.path.join(args.results, "*")))
     if not folders:
-        print(f"在 {args.results}/ 下没有找到 feedback_* 实验文件夹。")
+        # 如果没有 * 文件夹，尝试匹配 results 下的所有子目录
+        folders = [os.path.join(args.results, d) for d in os.listdir(args.results)
+                   if os.path.isdir(os.path.join(args.results, d))]
+        folders = sorted(folders)
+
+    if not folders:
+        print(f"在 {args.results}/ 下没有找到包含 trace 的实验文件夹。")
         return
 
     print(f"开始批量导出 {len(folders)} 个实验 -> {args.outdir}/")
@@ -329,4 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -37,10 +37,10 @@ yolov8n-obb.pt
 code_collector.py
 code_collector.md
 
-*/reports/*
-*/results/*
-*/pipelines/*
-*/launches/*
+*/report/*
+*/result/*
+*/pipeline/*
+*/launche/*
 
 # Prerequisites
 *.d
