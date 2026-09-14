@@ -58,25 +58,73 @@ public:
     }
 
 private:
-    void spin_cost_us(long long us) {
-        if (us <= 0) return;
-        const auto target = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
-        while (std::chrono::steady_clock::now() < target)
-        {
 
-        }
+    inline long long thread_cpu_time_us()
+    {
+        struct timespec ts{};
+
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+
+        return static_cast<long long>(ts.tv_sec) * 1'000'000LL
+          + static_cast<long long>(ts.tv_nsec) / 1'000LL;
     }
 
-    void do_work() {
-        tracepoint(eval, algo_execute, node_id_.c_str());
+    void spin_cost_us(long long us)
+    {
+        if (us <= 0)
+            return;
+
+        const long long start_cpu_us = thread_cpu_time_us();
+
+        long long segment_start_cpu_us = start_cpu_us;
+        int segment_cpu = sched_getcpu();
+
+        while (thread_cpu_time_us() - start_cpu_us < us)
+        {
+            const long long current_cpu_us = thread_cpu_time_us();
+            const int current_cpu = sched_getcpu();
+
+            if (current_cpu != segment_cpu)
+            {
+                const long long segment_cpu_us =
+                  current_cpu_us - segment_start_cpu_us;
+
+                tracepoint(eval, algo_working,
+                           node_id_.c_str(),
+                           segment_cpu,
+                           segment_cpu_us);
+
+                segment_cpu = current_cpu;
+                segment_start_cpu_us = current_cpu_us;
+            }
+        }
+
+        // while 结束，记录最后一段
+        const long long end_cpu_us = thread_cpu_time_us();
+        const long long segment_cpu_us =
+            end_cpu_us - segment_start_cpu_us;
+
+        tracepoint(
+            eval, algo_working,
+            node_id_.c_str(),
+            segment_cpu,
+            segment_cpu_us);
+    }
+
+    void do_work()
+    {
+        tracepoint(eval, algo_execute,
+                   node_id_.c_str());
 
         spin_cost_us(wcet_us_);
 
-        tracepoint(eval, algo_complete, node_id_.c_str());
+        tracepoint(eval, algo_complete,
+                   node_id_.c_str());
 
         auto msg = std_msgs::msg::String();
         msg.data = "payload";
-        for (auto& pub : pubs_) {
+        for (auto& pub : pubs_)
+        {
             pub->publish(msg);
         }
     }

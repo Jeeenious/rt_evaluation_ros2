@@ -7,6 +7,7 @@
 #include <deque>
 #include <string>
 #include <regex>
+#include <ctime>
 #include <sched.h>
 
 #include "rclcpp/rclcpp.hpp"
@@ -66,15 +67,118 @@ namespace eval
       }
     }
 
-private:
-    void spin_cost_us(long long us) {
-      if (us <= 0) return;
+  private:
+    inline long long thread_cpu_time_us()
+    {
+      struct timespec ts{};
 
-      const auto target = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
 
-      while (std::chrono::steady_clock::now() < target)
+      return static_cast<long long>(ts.tv_sec) * 1'000'000LL
+           + static_cast<long long>(ts.tv_nsec) / 1'000LL;
+    }
+
+    void spin_cost_us(long long us)
+    {
+      if (us <= 0)
+        return;
+
+      // 任务开始时的线程 CPU 时间
+      const long long start_cpu_us = thread_cpu_time_us();
+
+      // 当前 execution segment 的起点
+      long long segment_start_cpu_us = start_cpu_us;
+
+      // 当前所在 CPU
+      int segment_cpu = sched_getcpu();
+
+      while (true)
       {
+        /*
+         * CLOCK_THREAD_CPUTIME_ID 只统计当前线程真正获得 CPU
+         * 的时间。
+         *
+         * 因此：
+         *
+         *   A running  -> CPU time 增加
+         *   A 被抢占  -> CPU time 不增加
+         *
+         * 这正好可以用来模拟 WCET。
+         */
+        const long long current_cpu_us = thread_cpu_time_us();
 
+        const long long total_cpu_us =
+            current_cpu_us - start_cpu_us;
+
+        // ------------------------------------------------------------
+        // 1. 检查任务是否已经获得足够的 CPU execution time
+        // ------------------------------------------------------------
+        if (total_cpu_us >= us)
+        {
+          /*
+           * 当前 segment 实际只需要记录到 us。
+           *
+           * 例如：
+           *
+           *   wcet = 1000 us
+           *   当前 CPU time = 1003 us
+           *
+           * 不记录 1003，而是只记录剩余的 1000 - 已执行时间。
+           */
+          const long long segment_cpu_us =
+              us - (segment_start_cpu_us - start_cpu_us);
+
+          if (segment_cpu_us > 0)
+          {
+            tracepoint(
+                eval,
+                algo_working,
+                node_id_.c_str(),
+                segment_cpu,
+                segment_cpu_us);
+          }
+
+          break;
+        }
+
+        // ------------------------------------------------------------
+        // 2. 检查 CPU 是否发生 migration
+        // ------------------------------------------------------------
+        const int current_cpu = sched_getcpu();
+
+        if (current_cpu != segment_cpu)
+        {
+          /*
+           * CPU 从：
+           *
+           *     segment_cpu
+           *
+           * migration 到：
+           *
+           *     current_cpu
+           *
+           * 当前 segment 的长度使用 THREAD_CPUTIME 计算。
+           *
+           * 注意：
+           * 如果期间发生了同核抢占，这里的 CPU time 不会增长，
+           * 因此不会把被抢占的时间错误地算进 execution time。
+           */
+          const long long segment_cpu_us =
+              current_cpu_us - segment_start_cpu_us;
+
+          if (segment_cpu_us > 0)
+          {
+            tracepoint(
+                eval, algo_working,
+                node_id_.c_str(),
+                segment_cpu,
+                segment_cpu_us);
+          }
+
+          // 开始新的 execution segment
+          segment_cpu = current_cpu;
+          segment_start_cpu_us = current_cpu_us;
+        }
       }
     }
 
