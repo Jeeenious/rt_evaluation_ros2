@@ -15,10 +15,14 @@ from datetime import datetime
 # ==============================================================================
 # 1. 全局配置区
 # ==============================================================================
-LAUNCH_DIR = "./result/ROS"
-RESULT_BASE_DIR = "./result/ROS"
-WARMUP_TIME = 5.0  # 预热时间 (秒)
-RUN_TIME = 2.0  # 持续运行时间 (秒)
+LAUNCH_DIR = "./result/CIE_FIFO_IPC"
+RESULT_BASE_DIR = "./result/CIE_FIFO_IPC"
+WARMUP_TIME = 2.0  # 预热时间 (秒)
+RUN_TIME = 100.0  # 持续运行时间 (秒)
+
+# 断点续跑：默认跳过“结果目录下已有非空 trace”的用例（便于中断后接着跑）。
+# 需要全部重跑时加 --rerun，或把此项改为 False。
+SKIP_EXISTING_RESULTS = True
 
 # 进程 CPU 绑定配置 (方案 A：taskset 整棵进程树)
 # 核数根据 launch 文件名中的 m 自动解析（例如 feedback_..._m3_... 绑定 m 个核）
@@ -137,6 +141,19 @@ def parse_m_from_name(name):
         if m:
             return int(m.group(1))
     return 0
+
+
+def find_completed_result(test_name):
+    """该用例是否已有完成的结果；有则返回其 trace 目录，否则 None。
+
+    结果目录命名：<RESULT_BASE_DIR>/<test_name>_<HHMMSS>/trace
+    trace 只在实验成功归档后才出现，故“目录存在且非空”即视为已完成。
+    """
+    pattern = os.path.join(RESULT_BASE_DIR, f"{test_name}_*", "trace")
+    for trace_dir in sorted(glob.glob(pattern)):
+        if os.path.isdir(trace_dir) and os.listdir(trace_dir):
+            return trace_dir
+    return None
 
 
 # ==============================================================================
@@ -260,6 +277,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="自动化运行 CIE/MTE 实验控制脚本")
     p.add_argument("--launch-dir", default=None, help="launch 文件所在目录")
     p.add_argument("--result-dir", default=None, help="结果输出目录")
+    p.add_argument("--rerun", action="store_true",
+                   help="强制重跑已有结果的用例（默认跳过已有非空 trace 的用例）")
     return p.parse_args()
 
 
@@ -288,13 +307,29 @@ def main():
     launch_files = sorted(glob.glob(os.path.join(LAUNCH_DIR, "*.launch.py")))
     print(f"\n📁 发现 {len(launch_files)} 个待测实验用例。")
 
+    skip_existing = SKIP_EXISTING_RESULTS and not args.rerun
+    print(f"🔁 断点续跑: {'开启（跳过已有结果）' if skip_existing else '关闭（全部重跑）'}")
+
+    skipped = 0
     for i, l_file in enumerate(launch_files):
+        test_name = os.path.basename(l_file).replace(".launch.py", "")
+
+        if skip_existing:
+            done_trace = find_completed_result(test_name)
+            if done_trace:
+                skipped += 1
+                print(f"\n⏭️  跳过（已有结果）: {test_name}")
+                print(f"     {os.path.relpath(done_trace, RESULT_BASE_DIR)}")
+                continue
+
         print(f"\n----------------------------------------")
         print(f"📊 进度: [{i + 1}/{len(launch_files)}] -> {os.path.basename(l_file)}")
         print(f"----------------------------------------")
         run_single_test(l_file)
         time.sleep(2)
 
+    if skipped:
+        print(f"\n⏭️  共跳过 {skipped} 个已有结果的用例（加 --rerun 可强制重跑）。")
     print("\n✨ 所有实验测试已顺利完成！")
 
 
